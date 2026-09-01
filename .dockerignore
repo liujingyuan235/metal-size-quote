@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+runtime/
+*.xlsx
+BackCalculate20250916.py

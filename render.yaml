@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: metal-size-quote
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: MPLBACKEND
+        value: Agg
