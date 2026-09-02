@@ -269,7 +269,7 @@
         <section class="card">
           <div class="card-head"><div class="title-wrap"><span class="step">i</span><div><strong>计算说明</strong><small>当前链接的处理范围</small></div></div></div>
           <div class="card-body" style="color:#738197;font-size:11px;line-height:1.8">
-            <div>① 执行原始 Python 反算算法</div><div>② 计入刀口和余料约束</div><div>③ 根据反算原板体积计算重量</div><div>④ 报价 = 重量 × 单价 + 加工费</div><div style="margin-top:9px;color:#b1752b">当前用于板材二维排样，厚度统一。</div>
+            <div>① 在浏览器内执行二维排样反算</div><div>② 计入刀口和余料约束</div><div>③ 根据反算原板体积计算重量</div><div>④ 报价 = 重量 × 单价 + 加工费</div><div style="margin-top:9px;color:#b1752b">数据只在当前浏览器中处理，厚度统一。</div>
           </div>
         </section>
       </aside>
@@ -277,6 +277,7 @@
     </section>
   </main>
 
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
   <script>
     const rowsElement = document.getElementById('orderRows')
     const directRowsElement = document.getElementById('directRows')
@@ -472,16 +473,177 @@
       updatePrice(summary)
     }
 
+    function parseExcelWorkbook(buffer) {
+      if (!window.XLSX) throw new Error('Excel 组件加载失败，请检查网络后刷新页面')
+      const workbook = XLSX.read(buffer, { type: 'array' })
+      const sheetName = workbook.SheetNames[0]
+      const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { header: 1, raw: true, defval: '' })
+      const aliases = {
+        sizelong: ['长', '长度', '长(mm)', '长度(mm)', 'sizelong', 'length'],
+        sizewide: ['宽', '宽度', '宽(mm)', '宽度(mm)', 'sizewide', 'width'],
+        thickness: ['厚', '厚度', '厚(mm)', '厚度(mm)', 'thickness'],
+        direction: ['纹路', '方向', '纹路方向', 'direction'],
+        num: ['数量', '件数', 'num', 'quantity'],
+        orderNo: ['订单编号', '订单号', '编号', 'orderno', 'id'],
+        producer: ['厂家', '供应商', 'producer']
+      }
+      const normalize = text => String(text ?? '').replace(/\s+/g, '').toLowerCase()
+      let headerIndex = -1
+      let columns = {}
+      for (let rowIndex = 0; rowIndex < Math.min(20, rows.length); rowIndex += 1) {
+        const found = {}
+        rows[rowIndex].forEach((cell, columnIndex) => {
+          const header = normalize(cell)
+          Object.entries(aliases).forEach(([field, names]) => {
+            if (names.map(normalize).includes(header)) found[field] = columnIndex
+          })
+        })
+        if (['sizelong', 'sizewide', 'num'].every(field => field in found)) {
+          headerIndex = rowIndex
+          columns = found
+          break
+        }
+      }
+      if (headerIndex < 0) throw new Error('未找到“长、宽、数量”表头，请检查 Excel 第一张工作表')
+      const orders = []
+      const thicknesses = new Set()
+      const warnings = []
+      rows.slice(headerIndex + 1).forEach((row, offset) => {
+        if (!row.some(cell => String(cell).trim())) return
+        const excelRow = headerIndex + offset + 2
+        const length = Number(row[columns.sizelong])
+        const width = Number(row[columns.sizewide])
+        const quantity = Number(row[columns.num])
+        const direction = columns.direction == null || row[columns.direction] === '' ? 0 : Number(row[columns.direction])
+        const thickness = columns.thickness == null || row[columns.thickness] === '' ? null : Number(row[columns.thickness])
+        if (!(length > 0 && width > 0 && Number.isInteger(quantity) && quantity > 0 && [0, 1, 2].includes(direction))) {
+          warnings.push(`第 ${excelRow} 行数据格式不正确，已跳过`)
+          return
+        }
+        if (thickness > 0) thicknesses.add(thickness)
+        orders.push({
+          id: `EXCEL-${String(orders.length + 1).padStart(3, '0')}`,
+          orderNo: columns.orderNo == null || !String(row[columns.orderNo]).trim() ? `EXCEL-${String(orders.length + 1).padStart(3, '0')}` : String(row[columns.orderNo]).trim(),
+          sizelong: length,
+          sizewide: width,
+          num: quantity,
+          direction,
+          producer: columns.producer == null ? '' : String(row[columns.producer] || '').trim()
+        })
+      })
+      if (!orders.length) throw new Error('Excel 中没有可导入的有效订单行')
+      if (thicknesses.size > 1) warnings.push('文件中存在多个厚度；当前采用第一种厚度')
+      return { sheetName, rowCount: orders.length, orders, thickness: [...thicknesses][0] || null, warnings }
+    }
+
+    function chooseOrientations(piece) {
+      if (piece.direction === 2) return [{ width: piece.sizewide, height: piece.sizelong, rotated: true }]
+      const base = { width: piece.sizelong, height: piece.sizewide, rotated: false }
+      if (piece.direction === 1 || piece.sizelong === piece.sizewide) return [base]
+      return [base, { width: piece.sizewide, height: piece.sizelong, rotated: true }]
+    }
+
+    function tryPlaceOnPanel(panel, piece, maxLong, maxWide, kerf) {
+      const orientations = chooseOrientations(piece)
+      let best = null
+      orientations.forEach(shape => {
+        if (panel.x + shape.width <= maxLong && panel.y + shape.height <= maxWide) {
+          const waste = Math.max(panel.rowHeight, shape.height) - shape.height
+          if (!best || waste < best.waste) best = { ...shape, x: panel.x, y: panel.y, newRow: false, waste }
+        }
+        const nextY = panel.y + panel.rowHeight + (panel.rowHeight ? kerf : 0)
+        if (shape.width <= maxLong && nextY + shape.height <= maxWide) {
+          const waste = maxLong - shape.width
+          if (!best || waste < best.waste) best = { ...shape, x: 0, y: nextY, newRow: true, waste }
+        }
+      })
+      if (!best) return false
+      if (best.newRow) { panel.x = 0; panel.y = best.y; panel.rowHeight = 0 }
+      panel.placements.push({ ...best, orderNo: piece.orderNo, producer: piece.producer })
+      panel.x = best.x + best.width + kerf
+      panel.rowHeight = Math.max(panel.rowHeight, best.height)
+      panel.maxX = Math.max(panel.maxX, best.x + best.width)
+      panel.maxY = Math.max(panel.maxY, best.y + best.height)
+      panel.usedArea += best.width * best.height
+      return true
+    }
+
+    function panelImage(panel, index) {
+      const canvas = document.createElement('canvas')
+      canvas.width = 760
+      canvas.height = Math.max(300, Math.round(720 * panel.sizewide / panel.sizelong))
+      const context = canvas.getContext('2d')
+      const margin = 28
+      const scale = Math.min((canvas.width - margin * 2) / panel.sizelong, (canvas.height - margin * 2) / panel.sizewide)
+      context.fillStyle = '#f6f1e8'; context.fillRect(0, 0, canvas.width, canvas.height)
+      context.fillStyle = '#fff'; context.strokeStyle = '#1f2c3d'; context.lineWidth = 2
+      context.fillRect(margin, margin, panel.sizelong * scale, panel.sizewide * scale)
+      context.strokeRect(margin, margin, panel.sizelong * scale, panel.sizewide * scale)
+      const colors = ['#baded1', '#f3d6a2', '#cbd8ef', '#edc2c7', '#d8cceb']
+      panel.placements.forEach((item, itemIndex) => {
+        context.fillStyle = colors[itemIndex % colors.length]
+        context.strokeStyle = '#526273'; context.lineWidth = 1
+        const x = margin + item.x * scale, y = margin + item.y * scale
+        const width = item.width * scale, height = item.height * scale
+        context.fillRect(x, y, width, height); context.strokeRect(x, y, width, height)
+        if (width > 54 && height > 22) {
+          context.fillStyle = '#233447'; context.font = '12px sans-serif'; context.textAlign = 'center'
+          context.fillText(item.orderNo, x + width / 2, y + Math.min(height / 2 + 4, 18))
+        }
+      })
+      context.fillStyle = '#233447'; context.font = 'bold 13px sans-serif'; context.textAlign = 'left'
+      context.fillText(`原板 ${index + 1} · ${panel.sizelong} × ${panel.sizewide} mm`, margin, 18)
+      return canvas.toDataURL('image/png')
+    }
+
+    function calculateInBrowser(raw) {
+      const minLong = Math.max(1, raw.min_long), minWide = Math.max(1, raw.min_wide)
+      let maxLong = Math.max(minLong, raw.max_long), maxWide = Math.max(minWide, raw.max_wide)
+      const density = Math.max(0.01, raw.density), thickness = Math.max(0.1, raw.thickness)
+      const maxPanelArea = raw.max_weight > 0 ? raw.max_weight * 1e9 / (thickness * density) : Infinity
+      if (maxLong * maxWide > maxPanelArea) maxWide = Math.max(minWide, Math.floor(maxPanelArea / maxLong))
+      if (maxLong * maxWide > maxPanelArea) maxLong = Math.max(minLong, Math.floor(maxPanelArea / maxWide))
+      const pieces = []
+      raw.orderForm.forEach(order => {
+        if (!(order.sizelong > 0 && order.sizewide > 0 && Number.isInteger(order.num) && order.num > 0)) throw new Error(`订单 ${order.orderNo} 的尺寸或数量不正确`)
+        if (pieces.length + order.num > 5000) throw new Error('单次订单总数量不能超过 5000 件')
+        for (let index = 0; index < order.num; index += 1) pieces.push({ ...order })
+      })
+      pieces.sort((a, b) => b.sizelong * b.sizewide - a.sizelong * a.sizewide)
+      const panels = []
+      pieces.forEach(piece => {
+        let placed = panels.some(panel => tryPlaceOnPanel(panel, piece, maxLong, maxWide, raw.kerf))
+        if (!placed) {
+          const panel = { x: 0, y: 0, rowHeight: 0, maxX: 0, maxY: 0, usedArea: 0, placements: [] }
+          if (!tryPlaceOnPanel(panel, piece, maxLong, maxWide, raw.kerf)) throw new Error(`成品 ${piece.orderNo} 超出允许的最大原板尺寸`)
+          panels.push(panel)
+        }
+      })
+      const result = panels.map((panel, index) => {
+        panel.sizelong = Math.min(maxLong, Math.max(minLong, Math.ceil(panel.maxX)))
+        panel.sizewide = Math.min(maxWide, Math.max(minWide, Math.ceil(panel.maxY)))
+        const area = panel.sizelong * panel.sizewide
+        const cutRate = area ? panel.usedArea / area : 0
+        return { ...panel, cut_rate: cutRate, loss_rate: Math.max(0, 1 - cutRate), left_num: cutRate < 0.98 ? 1 : 0, imageUrl: panelImage(panel, index) }
+      })
+      const totalArea = result.reduce((sum, panel) => sum + panel.sizelong * panel.sizewide, 0)
+      const totalWeight = totalArea * thickness * density / 1000000
+      const materialAmount = totalWeight * raw.unitPrice
+      return {
+        runId: `WEB-${new Date().toISOString().replace(/\D/g, '').slice(0, 14)}`,
+        result,
+        summary: { panelCount: result.length, totalAreaM2: totalArea / 1000000, totalWeightKg: totalWeight, materialAmount, processingFee: raw.processingFee, totalPrice: materialAmount + raw.processingFee, density, unitPrice: raw.unitPrice, thickness },
+        engineLog: `浏览器二维排样完成：${pieces.length} 件成品，生成 ${result.length} 张原板。算法采用面积降序与货架式排样，可用于快速询价；正式下料前请由工艺人员复核。`
+      }
+    }
+
     async function importExcelFile(file) {
       clearMessage()
       const importButton = document.getElementById('importExcel')
       importButton.disabled = true
       importButton.textContent = '正在读取…'
       try {
-        const response = await fetch('/api/import-excel', { method: 'POST', headers: { 'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }, body: await file.arrayBuffer() })
-        const body = await response.json()
-        if (!response.ok || !body.ok) throw new Error(body.message || 'Excel 读取失败')
-        const imported = body.data
+        const imported = parseExcelWorkbook(await file.arrayBuffer())
         rowsElement.innerHTML = ''
         imported.orders.forEach(addOrderRow)
         if (imported.thickness) document.getElementById('thickness').value = imported.thickness
@@ -503,13 +665,12 @@
       clearMessage()
       if (!rowsElement.querySelector('tr')) { showMessage('至少需要添加一条订单尺寸', 'error'); return }
       calculateButton.disabled = true
-      calculateButton.textContent = '正在执行 Python 反算算法…'
+      calculateButton.textContent = '正在执行浏览器反算算法…'
       try {
-        const response = await fetch('/api/calculate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(buildPayload()) })
-        const body = await response.json()
-        if (!response.ok || !body.ok) throw new Error(body.message || '计算请求失败')
-        renderResults(body.data)
-        showMessage(`反算完成：生成 ${body.data.summary.panelCount} 张原板，预估报价 ${money(body.data.summary.totalPrice)}`, 'success')
+        await new Promise(resolve => setTimeout(resolve, 20))
+        const result = calculateInBrowser(buildPayload())
+        renderResults(result)
+        showMessage(`反算完成：生成 ${result.summary.panelCount} 张原板，预估报价 ${money(result.summary.totalPrice)}`, 'success')
         document.getElementById('resultCard').scrollIntoView({ behavior: 'smooth', block: 'start' })
       } catch (error) {
         showMessage(error.message || String(error), 'error')
